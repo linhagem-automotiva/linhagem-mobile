@@ -270,18 +270,27 @@ async function previewInvoiceXml(ev){
     if(!dets.length)throw Error('A nota não contém itens de produtos.');
     const totals=xmlDesc(inf,'ICMSTot');
     const freightXml=Number(xmlValue(totals,'vFrete')||0);
+    const discountXml=Number(xmlValue(totals,'vDesc')||0);
     if(!Number.isFinite(freightXml)||freightXml<0)throw Error('Frete da NF-e inválido.');
+    if(!Number.isFinite(discountXml)||discountXml<0)throw Error('Desconto da NF-e inválido.');
     const items=dets.map((d,i)=>{const pr=xmlChild(d,'prod');if(!pr)throw Error('Item '+(i+1)+' sem dados de produto.');
       const name=up(xmlValue(pr,'xProd')),rawUnit=up(xmlValue(pr,'uCom')),
-      unit=invoiceUnit(rawUnit),quantity=Number(xmlValue(pr,'qCom')),total=Number(xmlValue(pr,'vProd'));
-      if(!name||!unit||!Number.isFinite(quantity)||quantity<=0||!Number.isFinite(total)||total<0)throw Error('Item '+(i+1)+' inválido ou unidade não suportada ('+rawUnit+'). Confira o XML.');
+      unit=invoiceUnit(rawUnit),quantity=Number(xmlValue(pr,'qCom')),grossTotal=Number(xmlValue(pr,'vProd')),
+      discount=Number(xmlValue(pr,'vDesc')||0),total=Math.round((grossTotal-discount)*100)/100;
+      if(!name||!unit||!Number.isFinite(quantity)||quantity<=0||!Number.isFinite(grossTotal)||grossTotal<0||!Number.isFinite(discount)||discount<0||discount>grossTotal)throw Error('Item '+(i+1)+' inválido ou unidade não suportada ('+rawUnit+'). Confira o XML.');
       const existing=db.products.find(p=>p.name===name);
       if(existing&&existing.unit!==unit)throw Error('Unidade divergente no produto '+name+': cadastro '+existing.unit+' / nota '+unit+'. Ajuste antes de importar.');
-      return {name,unit,quantity,total,existingId:existing?.id||null};
+      return {name,unit,quantity,total,grossTotal,discount,existingId:existing?.id||null};
     });
-    invoicePending={key:chave,number,issuer,day,items,freightXml};
-    const rows=items.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.unit)}</td><td>${qty(i.quantity)}</td><td>${money(i.total)}</td><td>${i.existingId?'CADASTRADO':'NOVO'}</td></tr>`).join('');
-    modal('Conferir NF-e • '+number,`<p><b>Emitente:</b> ${esc(issuer||'NÃO INFORMADO')}<br><b>Número:</b> ${esc(number)}<br><b>Emissão:</b> ${esc(day)}<br><b>Chave:</b> <small>${esc(chave)}</small></p><div class="tablewrap"><table><thead><tr><th>PRODUTO</th><th>UN.</th><th>QUANTIDADE</th><th>VALOR</th><th>SITUAÇÃO</th></tr></thead><tbody>${rows}</tbody></table></div><p><b>Total dos produtos:</b> ${money(items.reduce((a,i)=>a+i.total,0))}</p><div class="grid"><div class="field"><label>Frete total a incorporar ao custo (R$)</label><input id="invoiceFreight" type="number" min="0" step="0.01" value="${freightXml.toFixed(2)}" oninput="updateInvoiceFreightPreview()"></div><div class="field"><label>Valor total de aquisição dos produtos</label><div id="invoiceAcquisitionTotal" class="note"></div></div></div><p class="note">O frete é lido do XML e pode ser corrigido antes da entrada. Será distribuído proporcionalmente ao valor de cada item, com ajuste de centavos no último item. Não some novamente o frete ao total da nota fiscal: ele já pode fazer parte do valor total da NF-e. Descontos, impostos e outras despesas não são rateados nesta versão. Confira os valores e a destinação dos produtos antes de confirmar.</p><button class="btn" onclick="confirmInvoiceXml()">Confirmar entrada no estoque</button>`);updateInvoiceFreightPreview();
+    const productGrossTotal=items.reduce((a,i)=>a+i.grossTotal,0);
+    const itemDiscountTotal=items.reduce((a,i)=>a+i.discount,0);
+    const productNetTotal=items.reduce((a,i)=>a+i.total,0);
+    // Usa os descontos informados em cada item. Se o total global da NF-e divergir,
+    // avisa para evitar registrar um custo diferente do documento fiscal.
+    if(Math.abs(itemDiscountTotal-discountXml)>0.02)throw Error('Os descontos dos itens ('+money(itemDiscountTotal)+') não conferem com o desconto total da NF-e ('+money(discountXml)+'). Confira o XML antes de importar.');
+    invoicePending={key:chave,number,issuer,day,items,freightXml,discountXml,productGrossTotal,productNetTotal,itemDiscountTotal};
+    const rows=items.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.unit)}</td><td>${qty(i.quantity)}</td><td>${money(i.grossTotal)}</td><td>${money(i.discount)}</td><td><b>${money(i.total)}</b></td><td>${i.existingId?'CADASTRADO':'NOVO'}</td></tr>`).join('');
+    modal('Conferir NF-e • '+number,`<p><b>Emitente:</b> ${esc(issuer||'NÃO INFORMADO')}<br><b>Número:</b> ${esc(number)}<br><b>Emissão:</b> ${esc(day)}<br><b>Chave:</b> <small>${esc(chave)}</small></p><div class="tablewrap"><table><thead><tr><th>PRODUTO</th><th>UN.</th><th>QUANTIDADE</th><th>BRUTO</th><th>DESCONTO</th><th>CUSTO LÍQUIDO</th><th>SITUAÇÃO</th></tr></thead><tbody>${rows}</tbody></table></div><p><b>Total bruto dos produtos:</b> ${money(productGrossTotal)}<br><b>Desconto total:</b> − ${money(itemDiscountTotal)}<br><b>Total dos produtos com desconto:</b> <strong>${money(productNetTotal)}</strong></p><div class="grid"><div class="field"><label>Frete total a incorporar ao custo (R$)</label><input id="invoiceFreight" type="number" min="0" step="0.01" value="${freightXml.toFixed(2)}" oninput="updateInvoiceFreightPreview()"></div><div class="field"><label>Valor total de aquisição dos produtos</label><div id="invoiceAcquisitionTotal" class="note"></div></div></div><p class="note">O desconto de cada item já é abatido do custo registrado no estoque. O frete é lido do XML e pode ser corrigido antes da entrada; se houver frete, será distribuído proporcionalmente ao custo líquido de cada item. Confira os valores antes de confirmar.</p><button class="btn" onclick="confirmInvoiceXml()">Confirmar entrada no estoque</button>`);updateInvoiceFreightPreview();
   }catch(e){alert('Não foi possível importar a NF-e: '+e.message)}
 }
 function invoiceFreightAllocation(items,freight){
@@ -311,7 +320,7 @@ function confirmInvoiceXml(){
     const eid=uid();db.entries.push({id:eid,productId:p.id,quantity:item.quantity,total:Math.round((item.total+allocations[index])*100)/100,productValue:item.total,freightAllocated:allocations[index],day:inv.day,note:'NF-E '+inv.number+' • '+up(inv.issuer),invoiceKey:inv.key,created:stamp});
     db.movements.push({id:uid(),type:'ENTRADA',productId:p.id,quantity:item.quantity,day:inv.day,reference:'NF-E '+inv.number,invoiceKey:inv.key,created:stamp});
   }
-  (db.invoiceImports||(db.invoiceImports=[])).push({id:uid(),key:inv.key,number:inv.number,issuer:up(inv.issuer),day:inv.day,itemCount:inv.items.length,freight,freightXml:inv.freightXml,productTotal:inv.items.reduce((a,i)=>a+i.total,0),created:stamp});
+  (db.invoiceImports||(db.invoiceImports=[])).push({id:uid(),key:inv.key,number:inv.number,issuer:up(inv.issuer),day:inv.day,itemCount:inv.items.length,freight,freightXml:inv.freightXml,productGrossTotal:inv.productGrossTotal,discountTotal:inv.itemDiscountTotal,productTotal:inv.items.reduce((a,i)=>a+i.total,0),created:stamp});
   invoicePending=null;persist();closeModal();toast('NF-e importada com frete rateado. Estoque atualizado.');
 }
 
